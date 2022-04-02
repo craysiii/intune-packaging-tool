@@ -1,5 +1,169 @@
 @page "/"
+@using IntunePackagingTool.Models
+@using IntunePackagingTool.Services
+@using System.Text.Json
+
+@inject AzureBlobService AzureBlobService
+@inject IHttpClientFactory HttpClientFactory
+@inject ILogger<Index> Logger
+
+@implements IDisposable
 
 <MudContainer Class="mt-16" MaxWidth="MaxWidth.Medium">
     <MudText Typo="Typo.h4" Align="Align.Center" GutterBottom="true">Build IntuneWin File</MudText>
+    
+    <MudGrid Class="mt-8" Justify="Justify.Center">
+        <MudItem xs="12" sm="12" md="10" lg="10" xl="10" xxl="10">
+            <MudCard Elevation="25" Class="rounded-lg pb-4">
+                <MudCardContent>
+                    @if (BuildProcessStarted == false)
+                    {
+                        <InputFile id="file-input" OnChange="HandleFilesSelected" hidden multiple/>
+                        <MudButton HtmlTag="label" Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Filled.InsertDriveFile" For="file-input" Size="Size.Large" Class="d-flex mt-4" Disabled="UploadProcessStarted" FullWidth="true">
+                            Select File(s)
+                        </MudButton>
+                        @if (PackageFiles.Count > 0)
+                        {
+                            <MudSelect T="string" Label="Setup File" @bind-Value="SourceFile">
+                                @foreach (var (fileName, packageFile) in PackageFiles)
+                                {
+                                    <MudSelectItem Value="@fileName"/>
+                                }
+                            </MudSelect>
+                        }
+                        @foreach (var (fileName, packageFile) in PackageFiles)
+                        {
+                            <MudText Align="Align.Center" Typo="Typo.body2" Class="mt-8">
+                                @fileName
+                                <MudIconButton ButtonType="ButtonType.Button" Variant="Variant.Filled" Color="Color.Error" Size="Size.Small" OnClick="@(() => DeletePackageFile(fileName))" Icon="@Icons.Filled.Delete"/>
+                            </MudText>
+                            <MudProgressLinear Color="Color.Primary" Indeterminate="false" Value="@packageFile.PercentageComplete"/>
+                        }
+                        @if (PackageFiles.Count > 0 && !string.IsNullOrWhiteSpace(SourceFile))
+                        {
+                            <MudButton HtmlTag="label" Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Filled.UploadFile" Size="Size.Large" Class="d-flex mt-4" OnClick="UploadPackageFiles" Disabled="UploadProcessStarted" FullWidth="true">
+                                Upload Files & Build Package
+                            </MudButton>
+                        }
+                    }
+                    @if (BuildProcessStarted)
+                    {
+                        @if (BuildProcessCompleted == false)
+                        {
+                            <MudProgressLinear Color="Color.Primary" Indeterminate="true" />
+                        }
+                        @if (!string.IsNullOrWhiteSpace(DownloadUri))
+                        {
+                            <MudButton HtmlTag="label" Variant="Variant.Filled" Color="Color.Primary" StartIcon="@Icons.Filled.Download" Size="Size.Large" Class="d-flex mt-4" Href="@DownloadUri" Disabled="!BuildProcessCompleted" FullWidth="true">
+                                Download Package
+                            </MudButton>
+                        }
+                        @if (ResponseCode != 0)
+                        {
+                            <MudText Align="Align.Center" Typo="Typo.h5">
+                                There was an error building your .intunewin file. Please try again.
+                            </MudText>
+                        }
+                    }
+                    
+                </MudCardContent>
+            </MudCard>
+        </MudItem>
+    </MudGrid>
 </MudContainer>
+
+@code
+{
+    private string PackageId { get; } = Guid.NewGuid().ToString();
+    private string? SourceFile { get; set; }
+    private string? DownloadUri { get; set; }
+    private int ResponseCode { get; set; }
+    private bool BuildProcessStarted { get; set; }
+    private bool BuildProcessCompleted { get; set; }
+    private bool UploadProcessStarted { get; set; }
+    private Dictionary<string, AzureUpload> PackageFiles { get; } = new Dictionary<string, AzureUpload>();
+
+    private void HandleFilesSelected(InputFileChangeEventArgs e)
+    {
+        PackageFiles.Clear();
+
+        foreach (var file in e.GetMultipleFiles(maximumFileCount: 50))
+        {
+            AzureUpload upload = new(file, PackageId, AzureBlobService);
+            PackageFiles.Add(file.Name, upload);
+            Logger.LogError("Added File {} To Package {}", file.Name, PackageId);
+        }
+    }
+
+    private void DeletePackageFile(string fileName)
+    {
+        PackageFiles.Remove(fileName);
+    }
+
+    private async Task UploadPackageFiles()
+    {
+        UploadProcessStarted = true;
+        
+        Logger.LogError("Source File is {}", SourceFile);
+
+        var uploadInProgress = true;
+
+        // Start uploads
+        foreach (var (fileName, packageFile) in PackageFiles)
+        {
+            AzureBlobService.UploadBlob(packageFile);
+        }
+
+        // Update progress bars
+        do
+        {
+            await Task.Delay(100);
+            var packageTransfers = PackageFiles.Count(x => x.Value.PercentageComplete < 100);
+            uploadInProgress = packageTransfers > 0;
+            StateHasChanged();
+        } while (uploadInProgress);
+
+        BuildProcessStarted = true;
+        StateHasChanged();
+        var azureFunctionUrl = Environment.GetEnvironmentVariable("AZURE_FUNCTION_URL");
+        
+        // Build JSON request
+        var requestBody = new
+        {
+            PackageId = PackageId,
+            SourceFile = SourceFile
+        };
+        var serializedBody = JsonSerializer.Serialize(requestBody);
+
+        // Send request to Azure Function
+        var client = HttpClientFactory.CreateClient();
+        var request = new HttpRequestMessage(HttpMethod.Post, azureFunctionUrl);
+        request.Headers.Add("Accept", "application/json");
+        request.Content = new StringContent(serializedBody);
+        var response = await client.SendAsync(request);
+
+        var responseBody = await response.Content.ReadAsStringAsync();
+        
+        Logger.LogError("Response: {}", responseBody);
+
+        try
+        {
+    // Consume response and show user
+            var responseObject = JsonSerializer.Deserialize<AzureFunctionResponse>(responseBody);
+            DownloadUri = responseObject?.Uri;
+        }
+        catch (Exception e)
+        {
+            ResponseCode = 30;
+        }
+        finally
+        {
+            BuildProcessCompleted = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        AzureBlobService.DeleteContainer(PackageId);
+    }
+}
