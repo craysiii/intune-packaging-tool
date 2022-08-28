@@ -4,10 +4,8 @@ EXPOSE 3000
 
 FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build
 WORKDIR /src
-COPY ["IntunePackagingTool.csproj", "IntunePackagingTool/"]
-RUN dotnet restore "IntunePackagingTool/IntunePackagingTool.csproj"
 COPY . .
-WORKDIR "/src/IntunePackagingTool"
+RUN dotnet restore "IntunePackagingTool.csproj"
 RUN dotnet build "IntunePackagingTool.csproj" -c Release -o /app/build
 
 FROM build AS publish
